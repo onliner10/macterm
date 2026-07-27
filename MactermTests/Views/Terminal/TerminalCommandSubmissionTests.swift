@@ -124,6 +124,44 @@ struct TerminalCommandSubmissionTests {
         ))
     }
 
+    /// The key codes `TerminalCommandSubmission` names are the same hardware
+    /// codes `HotkeyRegistry` binds shortcuts to. Cross-check every one the
+    /// registry knows, so a typo in either table shows up here rather than as a
+    /// silently mis-cleared evidence flag. (Backspace 51 and forward-delete 117
+    /// aren't bindable, so the registry has no entry to check them against.)
+    @Test(arguments: [
+        (0, "a"), (7, "x"), (8, "c"), (4, "h"), (13, "w"), (32, "u"), (40, "k"),
+        (36, "return"), (76, "return"), (53, "escape"),
+    ])
+    func namedKeyCodesMatchTheHotkeyVocabulary(keyCode: Int, token: String) {
+        #expect(HotkeyRegistry.baseToken(forKeyCode: UInt16(keyCode)) == token)
+    }
+
+    /// Every code `clearsInputEvidence` recognizes, and the modifier it needs.
+    /// A bare Ctrl-letter code with no Ctrl held, or a Cmd chord with no Cmd,
+    /// must not clear — that's what keeps ordinary typing evidence intact.
+    @Test(arguments: [
+        (53, false, false), // escape
+        (51, false, false), // backspace
+        (117, false, false), // forward delete
+        (4, true, false), // ctrl-h
+        (8, true, false), // ctrl-c
+        (13, true, false), // ctrl-w
+        (32, true, false), // ctrl-u
+        (40, true, false), // ctrl-k
+        (0, false, true), // cmd-a
+        (7, false, true), // cmd-x
+    ])
+    func clearsInputEvidenceCoversEachDiscardChord(keyCode: Int, hasControl: Bool, hasCommand: Bool) {
+        #expect(TerminalCommandSubmission.clearsInputEvidence(
+            keyCode: UInt16(keyCode), hasControl: hasControl, hasCommand: hasCommand
+        ))
+        guard hasControl || hasCommand else { return }
+        #expect(!TerminalCommandSubmission.clearsInputEvidence(
+            keyCode: UInt16(keyCode), hasControl: false, hasCommand: false
+        ))
+    }
+
     @Test
     func optionAsAltTextDoesNotCountAsLiteralContent() {
         #expect(!TerminalCommandSubmission.shouldRecordLiteralText(hasOption: true))

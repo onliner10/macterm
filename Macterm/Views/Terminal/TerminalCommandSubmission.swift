@@ -1,7 +1,35 @@
 import Foundation
 
 enum TerminalCommandSubmission {
-    private static let returnKeyCodes: Set<UInt16> = [36, 76]
+    /// Hardware key codes (Carbon `kVK_*`). Named rather than inlined: bare
+    /// literals behind a trailing gloss are easy to mistype on edit, and only
+    /// some of these exist in `HotkeyRegistry`'s shortcut vocabulary (backspace
+    /// and forward-delete aren't bindable), so that map can't supply them all.
+    /// `TerminalCommandSubmissionTests` cross-checks the ones it does know.
+    private enum KeyCode {
+        static let returnKey: UInt16 = 36
+        static let keypadEnter: UInt16 = 76
+        static let escape: UInt16 = 53
+        static let backspace: UInt16 = 51
+        static let forwardDelete: UInt16 = 117
+        static let a: UInt16 = 0
+        static let c: UInt16 = 8
+        static let h: UInt16 = 4
+        static let k: UInt16 = 40
+        static let u: UInt16 = 32
+        static let w: UInt16 = 13
+        static let x: UInt16 = 7
+    }
+
+    private static let returnKeyCodes: Set<UInt16> = [KeyCode.returnKey, KeyCode.keypadEnter]
+
+    /// Unmodified keys that abandon or erase what was typed.
+    private static let discardKeyCodes: Set<UInt16> = [KeyCode.escape, KeyCode.backspace, KeyCode.forwardDelete]
+    /// Readline line-editing chords: Ctrl-C abort, Ctrl-H backspace,
+    /// Ctrl-W kill word, Ctrl-U kill line, Ctrl-K kill to end of line.
+    private static let controlDiscardKeyCodes: Set<UInt16> = [KeyCode.c, KeyCode.h, KeyCode.w, KeyCode.u, KeyCode.k]
+    /// Cmd-A (select all, which precedes an overwrite) and Cmd-X (cut).
+    private static let commandDiscardKeyCodes: Set<UInt16> = [KeyCode.a, KeyCode.x]
 
     /// Best-effort evidence that the next Return submits actual prompt text.
     /// Terminal protocols do not expose a TUI's editor buffer, so the view
@@ -51,9 +79,9 @@ enum TerminalCommandSubmission {
         hasControl: Bool,
         hasCommand: Bool
     ) -> Bool {
-        if keyCode == 53 || keyCode == 51 || keyCode == 117 { return true } // Escape / delete
-        if hasControl, [4, 8, 13, 32, 40].contains(keyCode) { return true } // H/C/W/U/K
-        if hasCommand, [0, 7].contains(keyCode) { return true } // Select-all / cut
+        if discardKeyCodes.contains(keyCode) { return true }
+        if hasControl, controlDiscardKeyCodes.contains(keyCode) { return true }
+        if hasCommand, commandDiscardKeyCodes.contains(keyCode) { return true }
         return false
     }
 
