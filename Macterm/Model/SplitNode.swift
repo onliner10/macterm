@@ -74,9 +74,30 @@ struct TerminalExecutionTracker {
     private enum PendingOutputStart {
         case armed(Date)
         case candidate(Date)
+
+        /// The submission this start is attributed to, for window checks that
+        /// don't care which half of the two-heartbeat handshake we're in.
+        var submittedAt: Date {
+            switch self {
+            case let .armed(date),
+                 let .candidate(date): date
+            }
+        }
     }
 
     private static let submissionWindow: TimeInterval = 2
+
+    /// How long an activity-sourced run must go without an output heartbeat
+    /// before it settles to `.done`.
+    static let quietInterval: TimeInterval = 3
+    /// Slack added to the scheduled wake that performs that settle. The wake
+    /// must land strictly *after* the interval it tests: `settleIfQuiet`
+    /// no-ops if it fires even marginally early, and with every window
+    /// occluded there is no other timer left to retry — the pane would stay
+    /// `.running` forever. Both live here so they can't silently drift apart.
+    static let quietPollMargin: TimeInterval = 0.25
+    /// Delay for that wake. Deliberately > `quietInterval`, never equal to it.
+    static var quietPollDelay: TimeInterval { quietInterval + quietPollMargin }
 
     init(hasUserInteraction: Bool = false) {
         self.hasUserInteraction = hasUserInteraction
@@ -120,6 +141,12 @@ struct TerminalExecutionTracker {
         return false
     }
 
+    /// CALL ORDER CONTRACT: this clears `pendingOutputStart`, so a caller that
+    /// reports both an interaction and a submission for the same event MUST
+    /// record the interaction first — clear, then arm. `keyDown`, `sendText`,
+    /// and `sendKey` all do (`onInteraction?()` before `onCommandSubmitted?()`);
+    /// reversing either pair would leave the arm cleared and silently disable
+    /// in-place agent detection.
     mutating func recordUserInteraction() {
         hasUserInteraction = true
         // Typing, scrolling, or any other interaction after Return means later
@@ -134,6 +161,18 @@ struct TerminalExecutionTracker {
     ) {
         hasUserInteraction = true
         guard hasContent else {
+            // A blank Return landing inside a live arm's window is the second
+            // half of a bracketed paste: a raw TUI takes the newline in pasted
+            // text as literal content, so the earlier nonempty submission is
+            // the real one and THIS Return is what commits it. Keep the arm
+            // instead of reading an empty prompt. Outside that window (or with
+            // nothing armed — e.g. a plain shell, where `allowInPlaceOutputStart`
+            // is false) it is a genuine blank submission and suppresses.
+            if let submittedAt = pendingOutputStart?.submittedAt,
+               isWithinSubmissionWindow(date, submittedAt: submittedAt)
+            {
+                return
+            }
             pendingOutputStart = nil
             blankSubmissionAt = date
             return
@@ -484,8 +523,10 @@ final class Pane: Identifiable {
     /// Keep one lightweight wake scheduled from the final IO heartbeat so an
     /// occluded activity-owned run can still quiet-settle.
     @ObservationIgnored
-    private var activityQuietPollTask: Task<Void, Never>?
-    private let activityQuietPollDelay: Duration
+    private var activityQuietPollWake: DispatchWorkItem?
+    /// Always `TerminalExecutionTracker.quietPollDelay` outside tests, i.e.
+    /// strictly longer than the quiet interval the woken settle checks.
+    private let activityQuietPollDelay: TimeInterval
 
     /// Re-read the foreground process name from the process table and publish it
     /// only when it changed (so a steady poll doesn't churn `@Observable` and
@@ -588,7 +629,10 @@ final class Pane: Identifiable {
         )
     }
 
-    func settleTerminalActivityIfQuiet(now: Date = Date(), quietInterval: TimeInterval = 3) {
+    func settleTerminalActivityIfQuiet(
+        now: Date = Date(),
+        quietInterval: TimeInterval = TerminalExecutionTracker.quietInterval
+    ) {
         executionState = executionTracker.settleIfQuiet(
             now: now,
             quietInterval: quietInterval,
@@ -608,33 +652,34 @@ final class Pane: Identifiable {
         scheduleActivityQuietPollIfNeeded()
     }
 
+    /// Rearm the wake on every heartbeat, so it always measures silence from
+    /// the *last* one. A `DispatchWorkItem` rather than a `Task`: this runs at
+    /// the heartbeat's ~2 Hz per live pane, and cancel/reschedule on a work
+    /// item is cheaper than spinning up a task each time (same idiom as
+    /// `commandSubmissionEvidenceReset` in `GhosttyTerminalNSView`).
     private func scheduleActivityQuietPollIfNeeded() {
         guard executionTracker.isActivitySourced else {
             cancelActivityQuietPollIfNeeded()
             return
         }
-        activityQuietPollTask?.cancel()
-        let delay = activityQuietPollDelay
-        activityQuietPollTask = Task { @MainActor [weak self] in
-            do {
-                try await Task.sleep(for: delay)
-            } catch {
-                return
-            }
+        activityQuietPollWake?.cancel()
+        let wake = DispatchWorkItem { [weak self] in
             guard let self else { return }
-            activityQuietPollTask = nil
+            activityQuietPollWake = nil
             // This dedicated deadline bypasses ordinary event coalescing: if
             // every window is occluded there may be no timer left to retry.
             // AppState still performs the settle so acknowledgement and
             // persistence stay central.
             NotificationCenter.default.post(name: .terminalQuietSettleDeadline, object: self)
         }
+        activityQuietPollWake = wake
+        DispatchQueue.main.asyncAfter(deadline: .now() + activityQuietPollDelay, execute: wake)
     }
 
     private func cancelActivityQuietPollIfNeeded() {
         guard !executionTracker.isActivitySourced else { return }
-        activityQuietPollTask?.cancel()
-        activityQuietPollTask = nil
+        activityQuietPollWake?.cancel()
+        activityQuietPollWake = nil
     }
 
     @discardableResult
@@ -914,7 +959,7 @@ final class Pane: Identifiable {
         command: String? = nil,
         shell: String? = nil,
         env: [String: String]? = nil,
-        activityQuietPollDelay: Duration = .seconds(3)
+        activityQuietPollDelay: TimeInterval = TerminalExecutionTracker.quietPollDelay
     ) {
         self.projectPath = projectPath
         self.projectID = projectID

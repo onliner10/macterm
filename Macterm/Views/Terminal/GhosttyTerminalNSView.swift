@@ -667,10 +667,13 @@ final class GhosttyTerminalNSView: NSView {
         commandSubmissionEvidence.clear()
     }
 
-    /// `sendText` may contain a newline that executes directly, or it may be
-    /// bracketed-pasted into a raw TUI and need a following encoded Return.
-    /// Preserve its content briefly for the latter without leaving stale
-    /// evidence behind indefinitely in the former.
+    /// Bound the lifetime of evidence recorded from a clipboard payload that
+    /// carries its own newline. In a cooked shell that paste executes on the
+    /// spot and no Return follows, so the evidence would otherwise sit set
+    /// indefinitely and make some later blank Return look nonempty; in a raw
+    /// TUI the newline is literal text and the user's next Return is the real
+    /// submission, which needs it. Two seconds covers the latter without
+    /// stranding the former.
     private func preserveProgrammaticCommandInput(_ text: String) {
         commandSubmissionEvidence.recordText(text)
         let reset = DispatchWorkItem { [weak self] in
@@ -682,6 +685,10 @@ final class GhosttyTerminalNSView: NSView {
     }
 
     override func keyDown(with event: NSEvent) {
+        // MUST stay ahead of the `onCommandSubmitted?` at the end of this
+        // method — see `TerminalExecutionTracker.recordUserInteraction`'s
+        // call-order contract (interaction clears the in-place arm that
+        // submission then sets, so clear-then-arm is the only working order).
         onInteraction?()
         guard let surface else { super.keyDown(with: event)
             return
@@ -1253,6 +1260,9 @@ extension GhosttyTerminalNSView {
         guard let surface, !text.isEmpty else { return false }
         // Same liveness signal a keystroke sends (execution tracking + poll
         // resume), so an injected command updates the tab title promptly.
+        // MUST precede `onCommandSubmitted?` below — see
+        // `TerminalExecutionTracker.recordUserInteraction`'s call-order
+        // contract: interaction clears the in-place arm, submission sets it.
         onInteraction?()
         recordCommandInput(text)
         text.withCString { ptr in
@@ -1262,9 +1272,15 @@ extension GhosttyTerminalNSView {
             _ = ghostty_surface_key(surface, ke)
         }
         if TerminalCommandSubmission.textContainsNewline(text) {
-            let hasContent = consumeCommandSubmissionEvidence()
-            onCommandSubmitted?(hasContent)
-            if hasContent { preserveProgrammaticCommandInput(text) }
+            // Evidence is consumed here and NOT carried over. A raw TUI that
+            // bracketed-pastes this newline as literal text still needs the
+            // *following* Return to commit it — that Return arrives blank, and
+            // `TerminalExecutionTracker.recordCommandSubmission` keeps this
+            // submission's arm alive across it. Re-recording the payload here
+            // instead would make an unrelated blank Return within the next
+            // couple of seconds (a script sending `pane run` then `pane key
+            // return` at a shell prompt) report content it never had.
+            onCommandSubmitted?(consumeCommandSubmissionEvidence())
         }
         return true
     }
@@ -1287,6 +1303,9 @@ extension GhosttyTerminalNSView {
     @discardableResult
     func sendKey(keyCode: UInt16, mods flags: NSEvent.ModifierFlags) -> Bool {
         guard let surface else { return false }
+        // MUST precede the `onCommandSubmitted?` below — see
+        // `TerminalExecutionTracker.recordUserInteraction`'s call-order
+        // contract: interaction clears the in-place arm, submission sets it.
         onInteraction?()
         if TerminalCommandSubmission.clearsInputEvidence(
             keyCode: keyCode,

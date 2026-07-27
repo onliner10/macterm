@@ -358,4 +358,93 @@ struct TerminalExecutionTrackerTests {
         state = tracker.markOutputActivity(totalRows: 20, at: start.addingTimeInterval(0.5), currentState: state)
         #expect(state == .idle)
     }
+
+    // A raw TUI bracketed-pastes `pane run`'s trailing newline as literal text,
+    // so the Return that actually commits it arrives separately and blank. That
+    // blank Return must not tear down the arm the paste just set — the view no
+    // longer carries the payload's evidence forward for it, this does.
+    @Test
+    func blankSubmissionInsideWindowKeepsArmFromPastedSubmission() {
+        var tracker = TerminalExecutionTracker()
+        let submittedAt = Date(timeIntervalSince1970: 100)
+        tracker.recordCommandSubmission(at: submittedAt, allowInPlaceOutputStart: true, hasContent: true)
+        tracker.recordCommandSubmission(
+            at: submittedAt.addingTimeInterval(0.1), allowInPlaceOutputStart: true, hasContent: false
+        )
+
+        var state = tracker.markOutputActivity(
+            totalRows: 20, at: submittedAt.addingTimeInterval(0.5), currentState: .idle
+        )
+        state = tracker.markOutputActivity(totalRows: 20, at: submittedAt.addingTimeInterval(1), currentState: state)
+        #expect(state == .running)
+    }
+
+    @Test
+    func blankSubmissionInsideWindowKeepsAnAlreadyCandidateArm() {
+        var tracker = TerminalExecutionTracker()
+        let submittedAt = Date(timeIntervalSince1970: 100)
+        tracker.recordCommandSubmission(at: submittedAt, allowInPlaceOutputStart: true, hasContent: true)
+        // First heartbeat promotes armed → candidate; the blank Return lands
+        // between the two heartbeats.
+        var state = tracker.markOutputActivity(
+            totalRows: 20, at: submittedAt.addingTimeInterval(0.5), currentState: .idle
+        )
+        tracker.recordCommandSubmission(
+            at: submittedAt.addingTimeInterval(0.6), allowInPlaceOutputStart: true, hasContent: false
+        )
+        state = tracker.markOutputActivity(totalRows: 20, at: submittedAt.addingTimeInterval(1), currentState: state)
+        #expect(state == .running)
+    }
+
+    // The other half of the same rule: with nothing armed — a plain shell, where
+    // `allowInPlaceOutputStart` is false — a blank Return after an injected
+    // command is a genuine empty submission and still suppresses the redraw it
+    // provokes. This is the false positive the payload carry-over used to cause.
+    @Test
+    func blankSubmissionAfterInjectedShellCommandStillSuppresses() {
+        var tracker = TerminalExecutionTracker()
+        let submittedAt = Date(timeIntervalSince1970: 100)
+        var state = tracker.markOutputActivity(
+            totalRows: 10, at: submittedAt.addingTimeInterval(-1), currentState: .idle
+        )
+        tracker.recordCommandSubmission(at: submittedAt, allowInPlaceOutputStart: false, hasContent: true)
+        tracker.recordCommandSubmission(
+            at: submittedAt.addingTimeInterval(0.1), allowInPlaceOutputStart: false, hasContent: false
+        )
+
+        state = tracker.markOutputActivity(
+            totalRows: 20, at: submittedAt.addingTimeInterval(0.5), currentState: state
+        )
+        #expect(state == .idle)
+    }
+
+    @Test
+    func blankSubmissionAfterArmExpiresIsAGenuineBlankSubmission() {
+        var tracker = TerminalExecutionTracker()
+        let submittedAt = Date(timeIntervalSince1970: 100)
+        var state = tracker.markOutputActivity(
+            totalRows: 10, at: submittedAt.addingTimeInterval(-1), currentState: .idle
+        )
+        tracker.recordCommandSubmission(at: submittedAt, allowInPlaceOutputStart: true, hasContent: true)
+        // Past the 2s submission window, so the arm is stale and the blank
+        // Return suppresses rather than inheriting it.
+        let blankAt = submittedAt.addingTimeInterval(3)
+        tracker.recordCommandSubmission(at: blankAt, allowInPlaceOutputStart: true, hasContent: false)
+
+        state = tracker.markOutputActivity(totalRows: 20, at: blankAt.addingTimeInterval(0.5), currentState: state)
+        #expect(state == .idle)
+    }
+
+    // The scheduled wake must land strictly after the interval it checks —
+    // equal values would rely on `Task.sleep`/`asyncAfter` jitter always being
+    // positive, and an early wake leaves an occluded run stuck `.running`.
+    @Test
+    func quietPollDelayLeavesMarginOverQuietInterval() {
+        #expect(TerminalExecutionTracker.quietPollMargin > 0)
+        #expect(
+            TerminalExecutionTracker.quietPollDelay
+                == TerminalExecutionTracker.quietInterval + TerminalExecutionTracker.quietPollMargin
+        )
+        #expect(TerminalExecutionTracker.quietPollDelay > TerminalExecutionTracker.quietInterval)
+    }
 }

@@ -4,6 +4,15 @@ import Testing
 
 @MainActor
 struct PaneTests {
+    /// Box for a flag written from a main-queue notification block and read
+    /// back by the awaiting test body. Explicitly `@MainActor` (a nested type
+    /// does not inherit the enclosing type's global actor) so it is Sendable
+    /// enough to capture in the observer block.
+    @MainActor
+    private final class Fired {
+        var value = false
+    }
+
     private func shellName() -> String {
         // Mirror Pane.defaultShellName: the login shell from the password
         // database, not $SHELL (which is the app-launcher's shell).
@@ -331,28 +340,73 @@ struct PaneTests {
         #expect(p.executionState == .idle)
     }
 
+    // `macterm pane run "…"` into an agent: a raw TUI bracketed-pastes the
+    // trailing newline as literal text, so the Return that commits it comes
+    // through separately and blank. The submission's arm survives it.
+    @Test
+    func blankReturnAfterInjectedAgentCommandStillStartsTheRun() {
+        let p = Pane(projectPath: "/", projectID: UUID())
+        p.foregroundProcessName = "pi"
+        let submittedAt = Date(timeIntervalSince1970: 100)
+        p.recordCommandSubmission(hasContent: true, at: submittedAt)
+        p.recordCommandSubmission(hasContent: false, at: submittedAt.addingTimeInterval(0.1))
+
+        p.markOutputActivity(totalRows: 10, now: submittedAt.addingTimeInterval(0.5))
+        p.markOutputActivity(totalRows: 10, now: submittedAt.addingTimeInterval(1))
+        #expect(p.executionState == .running)
+    }
+
+    // Same call sequence at a plain shell prompt, where nothing arms: the blank
+    // Return is genuinely blank and keeps suppressing the redraw it causes.
+    @Test
+    func blankReturnAfterInjectedShellCommandStaysSuppressed() {
+        let p = Pane(projectPath: "/", projectID: UUID())
+        let submittedAt = Date(timeIntervalSince1970: 100)
+        p.markOutputActivity(totalRows: 10, now: submittedAt.addingTimeInterval(-1))
+        p.recordCommandSubmission(hasContent: true, at: submittedAt)
+        p.recordCommandSubmission(hasContent: false, at: submittedAt.addingTimeInterval(0.1))
+
+        p.markOutputActivity(totalRows: 20, now: submittedAt.addingTimeInterval(0.5))
+        #expect(p.executionState == .idle)
+    }
+
     @Test
     func outputActivitySchedulesQuietPollWake() async {
         let p = Pane(
             projectPath: "/",
             projectID: UUID(),
-            activityQuietPollDelay: .milliseconds(20)
+            activityQuietPollDelay: 0.02
         )
         p.recordUserInteraction()
         p.markOutputActivity(totalRows: 10)
 
         await confirmation("quiet output wakes the paused poll") { confirm in
+            let fired = Fired()
             let token = NotificationCenter.default.addObserver(
                 forName: .terminalQuietSettleDeadline,
                 object: p,
                 queue: .main
             ) { _ in
-                confirm()
+                // `queue: .main` runs this on the main thread, so the isolation
+                // assumption holds — same pattern the app's own notification
+                // observers use.
+                MainActor.assumeIsolated {
+                    fired.value = true
+                    confirm()
+                }
             }
             defer { NotificationCenter.default.removeObserver(token) }
 
             p.markOutputActivity(totalRows: 20)
-            try? await Task.sleep(for: .milliseconds(100))
+            // Poll instead of sleeping a fixed span: a single fixed wait sized
+            // against a 20ms delay is the shape that has flaked on loaded CI
+            // runners (macterm#181). This returns as soon as the wake lands and
+            // only spends the full budget when it genuinely never does.
+            for _ in 0 ..< 200 {
+                if fired.value { break }
+                try? await Task.sleep(for: .milliseconds(10))
+            }
+            #expect(fired.value)
         }
     }
 
