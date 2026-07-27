@@ -14,21 +14,34 @@ RESOURCES_MARKER="Macterm/Resources/terminfo"
 # and downloaded here, mirroring GhosttyKit — never compiled locally (zig).
 # Embedded into the bundle at Contents/Resources/zmx/zmx by embed-zmx.sh.
 ZMX_BIN="Macterm/Resources/zmx/zmx"
-GHOSTTY_HEADER="$XCFRAMEWORK_DIR/macos-arm64_x86_64/Headers/ghostty.h"
 
+# Capability probe for the one ABI Macterm hard-requires:
+# GHOSTTY_ACTION_OUTPUT_ACTIVITY (the pty-IO output heartbeat behind the tab
+# status indicator). Globs the slice dirs rather than hardcoding
+# `macos-arm64_x86_64` — a renamed slice would otherwise make this silently
+# answer "missing" and re-download on every single setup run with no clue why.
+# Takes the xcframework root so a candidate can be validated in a scratch dir
+# before it replaces the working copy.
 has_output_activity_action() {
-  [[ -f "$GHOSTTY_HEADER" ]] && grep -q 'GHOSTTY_ACTION_OUTPUT_ACTIVITY' "$GHOSTTY_HEADER"
+  local root="${1:-$XCFRAMEWORK_DIR}" header
+  for header in "$root"/*/Headers/ghostty.h; do
+    [[ -f "$header" ]] || continue
+    grep -q 'GHOSTTY_ACTION_OUTPUT_ACTIVITY' "$header" && return 0
+  done
+  return 1
 }
 
 need_xcframework=true
 need_resources=true
 need_zmx=true
 if [[ -d "$XCFRAMEWORK_DIR" ]]; then
-  if has_output_activity_action; then
+  if has_output_activity_action "$XCFRAMEWORK_DIR"; then
     need_xcframework=false
   else
+    # Deliberately NOT deleted here: the replacement is downloaded and
+    # validated into a scratch dir first (below), so a release that turns out
+    # to lack the ABI leaves this tree exactly as it was.
     echo "Existing GhosttyKit lacks GHOSTTY_ACTION_OUTPUT_ACTIVITY; refreshing it"
-    rm -rf "$XCFRAMEWORK_DIR"
   fi
 fi
 [[ -d "$RESOURCES_MARKER" ]] && need_resources=false
@@ -46,14 +59,30 @@ if [[ -z "$LATEST_TAG" ]]; then
 fi
 
 if $need_xcframework; then
-  gh release download "$LATEST_TAG" --pattern "GhosttyKit.xcframework.tar.gz" --repo "$FORK_REPO"
-  tar xzf GhosttyKit.xcframework.tar.gz
-  rm GhosttyKit.xcframework.tar.gz
-  if ! has_output_activity_action; then
+  # Download → extract → validate in a scratch dir, then swap. Validating in
+  # place would mean deleting a working (if older) framework before knowing the
+  # replacement is usable: a release missing the ABI would leave the tree with
+  # no framework at all, unbuildable, and re-running setup would hit the same
+  # failure. This way a bad release is a no-op, not a regression.
+  STAGE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/macterm-ghosttykit.XXXXXX")"
+  trap 'rm -rf "$STAGE_DIR"' EXIT
+  gh release download "$LATEST_TAG" --pattern "GhosttyKit.xcframework.tar.gz" --repo "$FORK_REPO" --dir "$STAGE_DIR"
+  tar xzf "$STAGE_DIR/GhosttyKit.xcframework.tar.gz" -C "$STAGE_DIR"
+  if ! has_output_activity_action "$STAGE_DIR/$XCFRAMEWORK_DIR"; then
     echo "Error: GhosttyKit from $LATEST_TAG lacks GHOSTTY_ACTION_OUTPUT_ACTIVITY" >&2
     echo "The thdxg/ghostty output-activity downstream patch must be released first." >&2
+    echo "This checkout hard-requires that ABI, so it cannot build against an older" >&2
+    echo "GhosttyKit; checkouts predating it build against any release. If you are" >&2
+    echo "bisecting across this commit, see AGENTS.md (Build & Run)." >&2
+    if [[ -d "$XCFRAMEWORK_DIR" ]]; then
+      echo "The existing $XCFRAMEWORK_DIR was left untouched." >&2
+    fi
     exit 1
   fi
+  rm -rf "$XCFRAMEWORK_DIR"
+  mv "$STAGE_DIR/$XCFRAMEWORK_DIR" "$XCFRAMEWORK_DIR"
+  rm -rf "$STAGE_DIR"
+  trap - EXIT
 fi
 
 # Fork-drift warning (macterm#168). The thdxg/ghostty fork ships prebuilt
